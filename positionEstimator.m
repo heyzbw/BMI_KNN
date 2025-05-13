@@ -1,46 +1,174 @@
-function [x, y] = positionEstimator(test_data, modelParameters)
-    bin_size = 20;
-    max_time = 320;  % 强制统一时间长度
+% Last edit: 11/03/25
+% Brain_X_SmaRt Group: Bowen Zhi, Xuanyun Qiu, Shiwei Liu, Ruiping Chi
+
+function [x, y, modelParameters] = positionEstimator(test_data, modelParameters)
     
-    % 动态计算分箱数量
-    num_bins = floor(max_time / bin_size);
-    binned_test = zeros(98, num_bins);
+    groupSize = 20;
+    smoothingWindow = 50;
     
-    % 分箱处理（严格对齐训练长度）
-    for bin = 1:num_bins
-        start = (bin-1)*bin_size +1;
-        finish = bin*bin_size;
-        if finish > size(test_data.spikes,2)
-            finish = size(test_data.spikes,2);
+    processedTrial = binAndSquare(test_data, groupSize, 1); % preprocessing
+    smoothedTrial = calculateFiringRates(processedTrial, groupSize, smoothingWindow); % preprocessing with smoothing
+    totalTimeSteps = size(test_data.spikes, 2);
+    % totalNeurons = size(smoothedTrial(1, 1).rates, 1);
+    
+    % extract relevant parameters from the model
+    if totalTimeSteps <= 560
+        
+        idx = (totalTimeSteps/groupSize) - (320/groupSize) + 1;
+        lowSpikeNeurons = modelParameters.lowFirers{1};
+        smoothedTrial.rates(lowSpikeNeurons, :) = [];
+        
+        firingData = reshape(smoothedTrial.rates, [], 1);
+        % totalNeurons = totalNeurons - length(lowSpikeNeurons);
+    
+        
+        classifierWeights = modelParameters.classify(idx).wLDA_kNN;
+        % pcaDimensions = modelParameters.classify(idx).dPCA_kNN;
+        ldaDimensions = modelParameters.classify(idx).dLDA_kNN;
+        optimalWeights = modelParameters.classify(idx).wOpt_kNN;
+        meanFiringRates = modelParameters.classify(idx).mFire_kNN;
+        
+        firingDataTest = optimalWeights' * (firingData - meanFiringRates); 
+        
+        predictedLabel = classifyKNN(firingDataTest, classifierWeights);
+        modelParameters.actualLabel = predictedLabel;
+        if predictedLabel ~= modelParameters.actualLabel
+            predictedLabel = modelParameters.actualLabel;
         end
-        binned_test(:,bin) = mean(test_data.spikes(:,start:finish),2);
+    
+    else % keep using the parameters derived from the longest training data length
+        predictedLabel = modelParameters.actualLabel;
+        % idx = 1;
+        lowSpikeNeurons = modelParameters.lowFirers{1};
+        smoothedTrial.rates(lowSpikeNeurons, :) = [];
+        
+        firingData = reshape(smoothedTrial.rates, [], 1);
+        % totalNeurons = totalNeurons - length(lowSpikeNeurons);
     end
     
-    % 截断测试数据分箱数以匹配训练维度
-    training_data = zeros(98, num_bins, 8);
-    for ang = 1:8
-        orig_cols = size(modelParameters.param(ang).firing_rates,2);
-        valid_cols = min(orig_cols, num_bins);
-        training_data(:,1:valid_cols,ang) = modelParameters.param(ang).firing_rates(:,1:valid_cols);
-    end
     
-    % 调用修正后的KNN函数
-    angle = knn_predicted_angles(training_data, binned_test(:,1:valid_cols), 1);
+    if totalTimeSteps <= 560
+        
+        % apply time shift
+        % totalNeurons = size(smoothedTrial(1, 1).rates, 1) - length(lowSpikeNeurons);
     
-    % 位置预测逻辑保持不变
-    dt = bin_size;
-    X = modelParameters.param(angle).dynamics;
-    current_bin = floor(size(test_data.spikes,2)/dt);
+        idx = (totalTimeSteps/groupSize) - (320/groupSize) + 1;
+        avgX = modelParameters.averages(idx).avX(:, predictedLabel);
+        avgY = modelParameters.averages(idx).avY(:, predictedLabel);
+        meanFiring = modelParameters.pcr(predictedLabel, idx).fMean;
+        pcaWeightsX = modelParameters.pcr(predictedLabel, idx).bx;
+        pcaWeightsY = modelParameters.pcr(predictedLabel, idx).by;
+        x = (firingData - mean(meanFiring))' * pcaWeightsX + avgX;
+        y = (firingData - mean(meanFiring))' * pcaWeightsY + avgY;
+        
+        try
+            x = x(totalTimeSteps, 1);
+            y = y(totalTimeSteps, 1);
+        catch
+            x = x(end, 1);
+            y = y(end, 1);
+        end
     
-    if current_bin >= size(X,2)
-        x = X(1,end); y = X(3,end);
-    else
-        if isempty(test_data.decodedHandPos)
-            x = test_data.startHandPos(1) + dt*X(2,1);
-            y = test_data.startHandPos(2) + dt*X(4,1);
-        else
-            x = X(1,current_bin); y = X(3,current_bin);
+    elseif totalTimeSteps > 560 % continue using model derived from the longest training time
+    
+        % apply time shift to the data
+        % totalNeurons = size(smoothedTrial(1, 1).rates, 1) - length(lowSpikeNeurons);
+        
+        avgX = modelParameters.averages(13).avX(:, predictedLabel);
+        avgY = modelParameters.averages(13).avY(:, predictedLabel);
+        % meanFiring = modelParameters.pcr(predictedLabel, 13).fMean;
+        pcaWeightsX = modelParameters.pcr(predictedLabel, 13).bx;
+        pcaWeightsY = modelParameters.pcr(predictedLabel, 13).by;
+        
+        x = (firingData(1:length(pcaWeightsX)) - mean(firingData(1:length(pcaWeightsX))))' * pcaWeightsX + avgX;
+        y = (firingData(1:length(pcaWeightsY)) - mean(firingData(1:length(pcaWeightsY))))' * pcaWeightsY + avgY;
+        
+        try
+            x = x(totalTimeSteps, 1);
+            y = y(totalTimeSteps, 1);
+        catch
+            x = x(end, 1);
+            y = y(end, 1);
         end
     end
+
 end
-   
+
+
+function processedTrial = binAndSquare(trial, groupSize, shouldSquare)
+
+    processedTrial = struct;
+
+    for i = 1:size(trial, 2)
+        for j = 1:size(trial, 1)
+
+            spikeData = trial(j, i).spikes; % spikes: neurons x time points
+            numNeurons = size(spikeData, 1);
+            numTimePoints = size(spikeData, 2);
+            newTimePoints = 1: groupSize: numTimePoints + 1; 
+            binnedSpikes = zeros(numNeurons, numel(newTimePoints) - 1);
+
+            for k = 1:numel(newTimePoints) - 1
+                binnedSpikes(:, k) = sum(spikeData(:, newTimePoints(k):newTimePoints(k+1) - 1), 2);
+            end
+
+            if shouldSquare
+                binnedSpikes = sqrt(binnedSpikes);
+            end
+
+            processedTrial(j, i).spikes = binnedSpikes;
+        end
+    end
+    
+end
+
+
+function finalTrial = calculateFiringRates(processedTrial, groupSize, windowSize)
+
+    finalTrial = struct;
+    window = 10 * (windowSize / groupSize);
+    normStd = windowSize / groupSize;
+    alpha = (window - 1) / (2 * normStd);
+    temp1 = -(window - 1) / 2 : (window - 1) / 2;
+    gaussianKernel = exp((-1 / 2) * (alpha * temp1 / ((window - 1) / 2)) .^ 2)';
+    gaussianWindow = gaussianKernel / sum(gaussianKernel);
+    
+    for i = 1:size(processedTrial, 2)
+
+        for j = 1:size(processedTrial, 1)
+            
+            smoothedRates = zeros(size(processedTrial(j, i).spikes, 1), size(processedTrial(j, i).spikes, 2));
+            
+            for k = 1:size(processedTrial(j, i).spikes, 1)
+                
+                smoothedRates(k, :) = conv(processedTrial(j, i).spikes(k, :), gaussianWindow, 'same') / (groupSize / 1000);
+            end
+            
+            finalTrial(j, i).rates = smoothedRates;
+        end
+    end
+
+end
+
+
+function [predictedLabels] = classifyKNN(testData, trainData)
+
+    trainMatrix = trainData';
+    testMatrix = testData;
+    trainSquared = sum(trainMatrix .* trainMatrix, 2);
+    testSquared = sum(testMatrix .* testMatrix, 1);
+
+    distanceMatrix = trainSquared(:, ones(1, length(testMatrix))) + testSquared(ones(1, length(trainMatrix)), :) - 2 * trainMatrix * testMatrix;
+    distanceMatrix = distanceMatrix';
+
+    k = 25;
+    [~, sortedIndices] = sort(distanceMatrix, 2);
+    nearestNeighbours = sortedIndices(:, 1:k);
+
+    % determine the most frequent direction label from the k-nearest neighbours
+    numTrain = size(trainData, 2) / 8;
+    directionLabels = [1 * ones(1, numTrain), 2 * ones(1, numTrain), 3 * ones(1, numTrain), 4 * ones(1, numTrain), 5 * ones(1, numTrain), 6 * ones(1, numTrain), 7 * ones(1, numTrain), 8 * ones(1, numTrain)]';
+    nearestLabels = reshape(directionLabels(nearestNeighbours), [], k);
+    predictedLabels = mode(mode(nearestLabels, 2));
+
+end
